@@ -1,7 +1,11 @@
 // MTUT offline cache: always try the network first, fall back to the last copy when offline
-const CACHE = "mtut-v1";
+const CACHE = "mtut-v2";
 self.addEventListener("install", () => self.skipWaiting());
-self.addEventListener("activate", e => e.waitUntil(self.clients.claim()));
+self.addEventListener("activate", e => e.waitUntil((async()=>{
+  const keys = await caches.keys();
+  await Promise.all(keys.filter(k => k.startsWith("mtut-") && k !== CACHE).map(k => caches.delete(k)));
+  await self.clients.claim();
+})()));
 self.addEventListener("fetch", e => {
   const r = e.request; if (r.method !== "GET") return;
   const u = new URL(r.url), same = u.origin === location.origin;

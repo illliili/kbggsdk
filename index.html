@@ -815,10 +815,18 @@ function nearbyNPCs(radius=4.5, exclude=[], includeShadow=false){
 // ====================================================================
 let cv, ctx;
 function resize(){
+  // Use the canvas's real CSS box, not only innerWidth/innerHeight. On iOS the
+  // visual viewport can change during pinch zoom, rotation, and PWA chrome changes.
+  const rect = cv.getBoundingClientRect();
+  const width = Math.max(1, rect.width || window.innerWidth || 1);
+  const height = Math.max(1, rect.height || window.innerHeight || 1);
   const dpr = Math.max(1, Math.min(2, window.devicePixelRatio||1));
-  cv.width = Math.floor(innerWidth*dpr); cv.height=Math.floor(innerHeight*dpr);
-  const cols = innerWidth<700 ? 12 : 20, rows = innerWidth<700 && innerHeight<innerWidth ? 8 : 13;   // phone: fewer, bigger tiles
-  const base = Math.min(innerWidth/(16*cols), innerHeight/(16*rows));
+  const pixelWidth = Math.max(1, Math.round(width*dpr));
+  const pixelHeight = Math.max(1, Math.round(height*dpr));
+  if (cv.width !== pixelWidth) cv.width = pixelWidth;
+  if (cv.height !== pixelHeight) cv.height = pixelHeight;
+  const cols = width<700 ? 12 : 20, rows = width<700 && height<width ? 8 : 13;   // phone: fewer, bigger tiles
+  const base = Math.min(width/(16*cols), height/(16*rows));
   RT.scale = clamp(Math.round(base*dpr*2)/2, 2, 5);
 }
 function isNight(min){ return min<345 || min>=1140; }
@@ -1892,7 +1900,8 @@ function parseJSONLoose(t){
 
 // ---- Provider calls ----
 function numOrNull(v){ if (v===""||v==null) return null; const n=Number(v); return isFinite(n)?n:null; }
-function extraParams(p){ if(!p.extra||!p.extra.trim()) return {}; try{ return JSON.parse(p.extra); }catch(e){ throw {code:"bad_extra", message:"추가 매개변수가 올바른 JSON이 아니에요."}; } }
+function validGeminiTopK(v){ const n=numOrNull(v); return Number.isInteger(n) && n>=1 && n<=64 ? n : null; }
+function extraParams(p){ if(!p.extra||!p.extra.trim()) return {}; try{ const x=JSON.parse(p.extra); if(!x || typeof x!=="object" || Array.isArray(x)) throw new Error("object required"); return x; }catch(e){ throw {code:"bad_extra", message:"추가 매개변수는 JSON 객체 형식이어야 해요. 예: {\"generationConfig\":{\"thinkingConfig\":{\"thinkingBudget\":0}}}"}; } }
 async function httpError(res){
   let body=""; try{ body=await res.text(); }catch(e){}
   let msg=body; try{ const j=JSON.parse(body); msg = j.error?.message || j.error?.status || j.message || body; }catch(e){}
@@ -1950,14 +1959,30 @@ async function callAnthropic(p, s, prompt, {onText, signal, maxTokens}){
 }
 const GEMINI_SAFETY_CATS = ["HARM_CATEGORY_HARASSMENT","HARM_CATEGORY_HATE_SPEECH","HARM_CATEGORY_SEXUALLY_EXPLICIT","HARM_CATEGORY_DANGEROUS_CONTENT"];
 async function callGemini(p, s, prompt, {onText, signal, json, maxTokens}){
-  const gen={}; const t=numOrNull(p.temperature), tp=numOrNull(p.topP), tk=numOrNull(p.topK), mt=numOrNull(p.maxTokens)||null;
+  const model = String(p.model).trim().replace(/^models\//,"").replace(/^publishers\/google\/models\//,"");
+  const gemini3 = /^gemini-3(?:[.-]|$)/i.test(model);
+  // Google recommends omitting custom sampling values for Gemini 3 models.
+  const gen={}; const t=gemini3?null:numOrNull(p.temperature), tp=gemini3?null:numOrNull(p.topP), tk=gemini3?null:validGeminiTopK(p.topK), mt=numOrNull(p.maxTokens)||null;
   if (t!=null) gen.temperature=t; if (tp!=null) gen.topP=tp; if (tk!=null) gen.topK=tk; if (mt!=null) gen.maxOutputTokens=mt;
   if (json) gen.responseMimeType="application/json";
   const body={contents:[{role:"user", parts:[{text:prompt}]}], generationConfig:gen};
   if (p.safety && p.safety!=="none") body.safetySettings = GEMINI_SAFETY_CATS.map(c=>({category:c, threshold:p.safety}));
-  const ex=extraParams(p); if (ex.generationConfig){ Object.assign(gen, ex.generationConfig); delete ex.generationConfig; } Object.assign(body, ex);
+  const ex=extraParams(p);
+  if (ex.generationConfig && typeof ex.generationConfig==="object" && !Array.isArray(ex.generationConfig)) Object.assign(gen, ex.generationConfig);
+  delete ex.generationConfig;
+  // Some saved profiles or custom JSON may contain topK=0. Vertex rejects it
+  // (the API error reports a valid range starting at 1), so omit invalid values.
+  // Gemini 3 models should receive no custom sampling values, including values
+  // supplied through Additional Parameters.
+  if (gemini3){ delete gen.temperature; delete gen.topP; delete gen.topK; delete gen.top_k; }
+  else {
+    if (Object.prototype.hasOwnProperty.call(gen,"top_k") && !Object.prototype.hasOwnProperty.call(gen,"topK")) gen.topK=gen.top_k;
+    delete gen.top_k;
+    const safeTopK=validGeminiTopK(gen.topK);
+    if (safeTopK==null) delete gen.topK; else gen.topK=safeTopK;
+  }
+  Object.assign(body, ex);
   const method = p.stream ? "streamGenerateContent?alt=sse" : "generateContent";
-  const model = String(p.model).replace(/^models\//,"");
   let url, headers={"Content-Type":"application/json"};
   if (p.source==="google"){ url=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:${method}`; headers["x-goog-api-key"]=s.key; }
   else if (p.source==="vertex_express"){ url=`https://aiplatform.googleapis.com/v1/publishers/google/models/${encodeURIComponent(model)}:${method}`; headers["x-goog-api-key"]=s.key; }
@@ -2974,7 +2999,13 @@ function loop(now){
 // BOOT
 // ====================================================================
 async function boot(){
-  cv=$("#game"); ctx=cv.getContext("2d"); resize(); addEventListener("resize",resize);
+  cv=$("#game"); ctx=cv.getContext("2d"); resize();
+  let resizeFrame=0;
+  const scheduleCanvasResize=()=>{ if(resizeFrame) return; resizeFrame=requestAnimationFrame(()=>{ resizeFrame=0; resize(); }); };
+  addEventListener("resize",scheduleCanvasResize,{passive:true});
+  addEventListener("orientationchange",scheduleCanvasResize,{passive:true});
+  addEventListener("pageshow",scheduleCanvasResize,{passive:true});
+  if ("ResizeObserver" in window){ const canvasObserver=new ResizeObserver(scheduleCanvasResize); canvasObserver.observe(cv); }
   MAPS=buildMaps(); await loadGfx(); await rebuildGfx(); await loadConnections();
   Chat.el=$("#chat");
   addEventListener("keydown",e=>{
@@ -2994,14 +3025,30 @@ async function boot(){
   $("#btnPeople").onclick=()=>{ if(RT.started && !Chat.session) openPeople(); };
   $("#btnSettings").onclick=()=>{ if(RT.started) openSettings(); };
   $("#btnMap").onclick=()=>{ if(RT.started && !Chat.session) openMapMenu(); };
-  cv.addEventListener("click",e=>{ if (RT.battle){ battleTap(e); return; } if(!RT.started||RT.uiOpen) return; const rect=cv.getBoundingClientRect(); const dpr=cv.width/rect.width; const mx=(e.clientX-rect.left)*dpr+RT.cam.x, my=(e.clientY-rect.top)*dpr+RT.cam.y; const TS=16*RT.scale;
-    RT.quest=null; const reach = COARSE ? 0.85 : 0.6; let hit=null, hd=Infinity;
-    for (const n of Object.values(RT.npcs)){ if(n.map!==S.player.map||n.transit||n.shadow) continue; const ddx=Math.abs(mx-n.x*TS); if (ddx<TS*reach && my>(n.y-1.4)*TS && my<(n.y+0.45)*TS && ddx<hd){ hd=ddx; hit=n; } }
-    if (hit){ if (Math.hypot(hit.x-S.player.x,hit.y-S.player.y)<2.2){ RT.ppath=null; RT.auto=null; Chat.open([hit.id]); } else tapMove(Math.floor(hit.x), Math.floor(hit.y), {npc:hit.id, tries:0}); return; }
-    const m=MAPS[S.player.map], tx=Math.floor(mx/TS), ty=Math.floor(my/TS); if (tx<0||ty<0||tx>=m.w||ty>=m.h) return;
-    const t=getT(m,tx,ty); tapMove(tx, ty, t===T.GATE?{gate:true} : t===T.BED?{bed:true} : null); });
+  // Pointer events work consistently for mouse, pen, and iPhone touch. Using
+  // pointerup also makes a short finger-drag select its release tile.
+  let canvasPointerId=null;
+  cv.addEventListener("pointerdown",e=>{
+    if (!e.isPrimary || (e.pointerType==="mouse" && e.button!==0)) return;
+    canvasPointerId=e.pointerId;
+    try{ cv.setPointerCapture(e.pointerId); }catch(err){}
+    e.preventDefault();
+  },{passive:false});
+  cv.addEventListener("pointerup",e=>{
+    if (canvasPointerId!==e.pointerId) return;
+    canvasPointerId=null; e.preventDefault();
+    const r=cv.getBoundingClientRect();
+    if (e.clientX<r.left || e.clientX>r.right || e.clientY<r.top || e.clientY>r.bottom) return;
+    handleCanvasPointer(e);
+  },{passive:false});
+  cv.addEventListener("pointercancel",()=>{ canvasPointerId=null; });
+  cv.addEventListener("lostpointercapture",()=>{ canvasPointerId=null; });
+  if (!("PointerEvent" in window)) cv.addEventListener("click",handleCanvasPointer);
   $("#prompt").addEventListener("click",()=>interact());
-  if (window.visualViewport){ visualViewport.addEventListener("resize",()=>fitViewport(true)); visualViewport.addEventListener("scroll",()=>fitViewport(false)); }
+  if (window.visualViewport){
+    visualViewport.addEventListener("resize",()=>{ scheduleCanvasResize(); fitViewport(true); });
+    visualViewport.addEventListener("scroll",()=>fitViewport(false));
+  }
   if ("serviceWorker" in navigator && location.protocol==="https:" && !IN_CLAUDE) navigator.serviceWorker.register("sw.js").catch(()=>{});
   requestAnimationFrame(loop);
   await initAI();
@@ -3080,9 +3127,16 @@ function connCard(p, api){
     const listId="ml_"+p.id; const dl=h("datalist",{id:listId}, (MODEL_LISTS[p.id]||MODEL_SUGGEST[p.source]||[]).map(m=>h("option",{value:m})));
     const mi=h("input",{type:"text", value:p.model||"", placeholder:"모델 이름", list:listId}); mi.onchange=()=>{ p.model=mi.value.trim(); save(true); };
     const lb=h("button",{class:"btn small",onclick:async()=>{ lb.disabled=true; lb.textContent="불러오는 중…"; try{ MODEL_LISTS[p.id]=await listModels(p); toast(`모델 ${MODEL_LISTS[p.id].length}개를 찾았어요. 이름 칸을 누르면 목록이 떠요.`); api.rebuild(); }catch(e){ toast(connErrorText(e)||"모델 목록을 불러오지 못했어요."); lb.disabled=false; lb.textContent="모델 목록 불러오기"; } }},"모델 목록 불러오기");
-    body.append(h("div",{class:"field"},h("label",{},"모델"),mi,dl, pv.list?h("div",{style:"margin-top:4px"},lb):h("div",{class:"hint"},"모델 이름을 직접 적어요. 예: Vertex에서 쓰는 Gemini 모델 ID.")));
+    const modelHint=p.source==="vertex_express"?"Vertex Express 모드에는 모델 ID만 입력하세요. 예: gemini-2.5-flash (publishers/google/models/ 접두사는 붙이지 않아요).":"모델 이름을 직접 적어요. 예: Vertex에서 쓰는 Gemini 모델 ID.";
+    body.append(h("div",{class:"field"},h("label",{},"모델"),mi,dl, pv.list?h("div",{style:"margin-top:4px"},lb):h("div",{class:"hint"},modelHint)));
     // sampling
-    const num=(label,key,ph)=>{ const i=h("input",{type:"text",inputmode:"decimal",value:p[key]??"",placeholder:ph}); i.onchange=()=>{ p[key]=i.value.trim(); save(); }; return h("div",{class:"field"},h("label",{},label),i); };
+    const num=(label,key,ph)=>{
+      const isGeminiTopK=key==="topK" && ["google","vertex_sa","vertex_express"].includes(p.source);
+      if (isGeminiTopK && p[key]!=="" && validGeminiTopK(p[key])==null){ p[key]=""; save(); }
+      const i=h("input",{type:isGeminiTopK?"number":"text",inputmode:"decimal",min:isGeminiTopK?"1":null,max:isGeminiTopK?"64":null,step:isGeminiTopK?"1":null,value:p[key]??"",placeholder:ph});
+      i.onchange=()=>{ const v=i.value.trim(); if(isGeminiTopK && v!=="" && validGeminiTopK(v)==null){ p[key]=""; i.value=""; toast("Gemini / Vertex의 top_k는 1~64 정수만 가능해요. 기본값을 쓰려면 비워 두세요."); } else p[key]=v; save(); };
+      return h("div",{class:"field"},h("label",{},label),i);
+    };
     body.append(h("div",{class:"row3"}, num("온도 (temperature)","temperature","기본값"), num("top_p","topP","기본값"), num("top_k","topK","기본값"), num("최대 응답 토큰","maxTokens","기본값")));
     body.append(h("p",{class:"hint"},"비워 두면 모델의 기본값을 써요(보내지 않음). 실리태번의 샘플러 칸과 같아요."));
     const st=h("input",{type:"checkbox",checked:p.stream||null}); st.onchange=()=>{ p.stream=st.checked; save(); };
@@ -3093,7 +3147,7 @@ function connCard(p, api){
     }
     const ex=h("textarea",{style:"min-height:60px;font-family:monospace;font-size:12px",placeholder:'예: {"generationConfig":{"thinkingConfig":{"thinkingBudget":0}}} 또는 {"presence_penalty":0.3}'}, p.extra||"");
     ex.onchange=()=>{ p.extra=ex.value; save(); };
-    body.append(h("div",{class:"field"},h("label",{},"추가 매개변수 (JSON, 선택)"),ex,h("div",{class:"hint"},"요청 본문에 그대로 합쳐져요. 실리태번의 'Additional Parameters'와 같아요.")));
+    body.append(h("div",{class:"field"},h("label",{},"추가 매개변수 (JSON, 선택)"),ex,h("div",{class:"hint"},["요청 본문에 그대로 합쳐져요. 실리태번의 'Additional Parameters'와 같아요.", ["google","vertex_sa","vertex_express"].includes(p.source)?" Vertex의 topK는 1~64 정수만 허용돼요. 0을 넣지 말고 기본값을 쓰려면 topK 항목을 생략하세요.":""] .join(""))));
     const rk=h("input",{type:"checkbox",checked:p.rememberKey||null}); rk.onchange=()=>{ p.rememberKey=rk.checked; save(); };
     body.append(h("label",{class:"hint",style:"display:block;margin-bottom:10px"}, rk, " 이 브라우저에 키 저장 (끄면 페이지를 닫을 때 키가 사라져요)"));
   }
@@ -3741,9 +3795,32 @@ function renderBattle(now){
     if (o.shown!==tx){ o.shown=tx; o.b.textContent=tx; } const dis=dead||cd>0||B.over; if (o.b.disabled!==dis) o.b.disabled=dis; }
   const info=`${B.opts.title||"전투"} · 내 체력 ${Math.max(0,Math.round(B.P.hp))}/${B.P.maxhp} · 남은 적 ${B.units.filter(u=>u.side==="foe"&&u.hp>0).length}`, el=$("#btInfo"); if (el && el.textContent!==info) el.textContent=info;
 }
+function canvasPoint(e){
+  const r=cv.getBoundingClientRect();
+  return {x:(e.clientX-r.left)*(cv.width/Math.max(1,r.width)), y:(e.clientY-r.top)*(cv.height/Math.max(1,r.height))};
+}
+function handleCanvasPointer(e){
+  if (RT.battle){ battleTap(e); return; }
+  if (!RT.started || RT.uiOpen) return;
+  const point=canvasPoint(e), mx=point.x+RT.cam.x, my=point.y+RT.cam.y, TS=16*RT.scale;
+  RT.quest=null; const reach=COARSE?0.85:0.6; let hit=null, hd=Infinity;
+  for (const n of Object.values(RT.npcs)){
+    if(n.map!==S.player.map||n.transit||n.shadow) continue;
+    const ddx=Math.abs(mx-n.x*TS);
+    if(ddx<TS*reach && my>(n.y-1.4)*TS && my<(n.y+0.45)*TS && ddx<hd){ hd=ddx; hit=n; }
+  }
+  if(hit){
+    if(Math.hypot(hit.x-S.player.x,hit.y-S.player.y)<2.2){ RT.ppath=null; RT.auto=null; Chat.open([hit.id]); }
+    else tapMove(Math.floor(hit.x),Math.floor(hit.y),{npc:hit.id,tries:0});
+    return;
+  }
+  const m=MAPS[S.player.map], tx=Math.floor(mx/TS), ty=Math.floor(my/TS);
+  if(tx<0||ty<0||tx>=m.w||ty>=m.h) return;
+  const t=getT(m,tx,ty); tapMove(tx,ty,t===T.GATE?{gate:true}:t===T.BED?{bed:true}:null);
+}
 function battleTap(e){
   const B=RT.battle; if (!B || B.over || B.hold || !B.view) return;
-  const rect=cv.getBoundingClientRect(), k=cv.width/rect.width, v=B.view, x=((e.clientX-rect.left)*k-v.ox)/v.ts, y=((e.clientY-rect.top)*k-v.oy)/v.ts;
+  const point=canvasPoint(e), v=B.view, x=(point.x-v.ox)/v.ts, y=(point.y-v.oy)/v.ts;
   let hit=null; for (const u of B.units) if (u.side==="foe" && u.hp>0 && Math.hypot(u.x-x,(u.y-u.r)-y)<Math.max(0.7,u.r+0.4)) hit=u;
   if (hit){ B.ptgt=hit; B.dest=null; } else { B.ptgt=null; B.dest={x:clamp(x,0.4,B.m.w-0.4), y:clamp(y,0.4,B.m.h-0.4)}; }
 }
