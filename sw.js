@@ -1,5 +1,5 @@
 // MTUT offline cache: always ask the network for the newest copy first, fall back to the last copy when offline
-const CACHE = "mtut-v5";
+const CACHE = "mtut-v17";
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", e => e.waitUntil((async () => {
   const keys = await caches.keys();
